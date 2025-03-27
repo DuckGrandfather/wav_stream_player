@@ -204,12 +204,23 @@
                 audio.currentTime = currentPlaybackPosition;
                 resumeCount++;
                 
-                if (isPlaying || forcePlay) {
+                const shouldPlay = isPlaying || forcePlay || userInteracted;
+                
+                if (shouldPlay) {
                     try {
-                        await audio.play();
-                        log(`Playback resumed at position ${currentPlaybackPosition.toFixed(2)}s`);
+                        const playPromise = audio.play();
+                        if (playPromise !== undefined) {
+                            await playPromise;
+                            isPlaying = true;  // 明确设置播放状态
+                            log(`Playback resumed at position ${currentPlaybackPosition.toFixed(2)}s`);
+                        }
                     } catch (err) {
                         log(`Failed to resume playback: ${err.message}`);
+                        // 如果是首次交互错误，提示用户
+                        if (err.name === 'NotAllowedError' && !userInteracted) {
+                            updateStatus('需要用户交互 - 请点击播放按钮');
+                            playButton.disabled = false;
+                        }
                     }
                 }
             }
@@ -365,7 +376,8 @@
                     if (audioChunks.length % 5 === 0) {
                         log(`Creating intermediate blob after ${audioChunks.length} chunks (${formatBytes(totalBytes)})`, true);
                         
-                        // 在创建新blob前保存当前播放位置
+                        // 在创建新blob前保存当前播放位置和状态
+                        const wasPlaying = !audio.paused;
                         savePlaybackPosition();
                         
                         blobCreateCount++;
@@ -382,6 +394,11 @@
                         log(`Created intermediate blob URL #${blobCreateCount}: ${lastBlobUrl}`);
                         log(`Setting audio source to blob #${blobCreateCount} (${formatBytes(totalBytes)})`);
                         
+                        // 使用临时变量保存状态
+                        const currentPosition = currentPlaybackPosition;
+                        const shouldPlay = wasPlaying || isPlaying || userInteracted;
+                        
+                        // 设置新音频源
                         audio.src = lastBlobUrl;
 
                         if (!autoPlayStarted && !userInteracted) {
@@ -401,11 +418,30 @@
                                 playButton.disabled = false;
                             }
                         } else {
-                            // 等待音频元数据加载，然后恢复播放位置
+                            // 等待音频元数据加载，然后强制恢复播放
                             audio.addEventListener('loadedmetadata', async () => {
-                                // 尝试恢复之前的播放位置
-                                await resumePlayback(userInteracted || isPlaying);
-                                log(`Position restored to ${audio.currentTime.toFixed(2)}s`);
+                                try {
+                                    // 设置时间位置
+                                    audio.currentTime = currentPosition;
+                                    resumeCount++;
+                                    log(`Position restored to ${audio.currentTime.toFixed(2)}s`);
+                                    
+                                    // 强制恢复播放状态
+                                    if (shouldPlay) {
+                                        const playPromise = audio.play();
+                                        if (playPromise !== undefined) {
+                                            await playPromise;
+                                            isPlaying = true;
+                                            log(`Playback continued with chunk #${blobCreateCount}`, true);
+                                        }
+                                    }
+                                } catch (err) {
+                                    log(`Failed to continue playback: ${err.message}`);
+                                    if (!userInteracted) {
+                                        updateStatus('需要用户交互 - 请点击播放按钮');
+                                        playButton.disabled = false;
+                                    }
+                                }
                             }, { once: true });
                         }
                     }
