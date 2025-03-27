@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Streamed Audio Playback</title>
+    <style>
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            padding: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        #debug {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            max-width: 700px;
+            word-wrap: break-word;
+            max-height: 350px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .audio-info {
+            margin: 10px 0;
+            font-family: monospace;
+            background: #f5f5f5;
+            padding: 8px;
+            border-radius: 4px;
+            width: 500px;
+        }
+        .status {
+            color: #666;
+            font-style: italic;
+            margin: 10px 0;
+        }
+        .button-container {
+            display: flex;
+            gap: 10px;
+        }
+        .stream-stats {
+            display: flex;
+            justify-content: space-between;
+            background: #e9f7ff;
+            padding: 10px;
+            border-radius: 4px;
+            width: 500px;
+            margin: 10px 0;
+            font-family: monospace;
+        }
+        .highlight {
+            color: #d81b60;
+            font-weight: bold;
+        }
+        .playback-info {
+            background: #fff8e1;
+            padding: 10px;
+            border-radius: 4px;
+            width: 500px;
+            margin: 5px 0;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="button-container">
+            <button id="startButton">Start Streaming</button>
+            <button id="playButton" disabled>Play Audio</button>
+            <button id="clearButton">Clear Log</button>
+        </div>
+        <div class="status" id="statusText"></div>
+        <div class="stream-stats" id="streamStats"></div>
+        <div class="playback-info" id="playbackInfo"></div>
+        <audio id="audio" controls></audio>
+        <div class="audio-info" id="audioInfo"></div>
+        <div id="debug"></div>
+    </div>
+    <script>
+        const audio = document.getElementById('audio');
+        const startButton = document.getElementById('startButton');
+        const playButton = document.getElementById('playButton');
+        const clearButton = document.getElementById('clearButton');
+        const debugDiv = document.getElementById('debug');
+        const audioInfo = document.getElementById('audioInfo');
+        const statusText = document.getElementById('statusText');
+        const streamStats = document.getElementById('streamStats');
+        const playbackInfo = document.getElementById('playbackInfo');
+        
+        let audioChunks = [];
+        let isStreaming = false;
+        let autoPlayStarted = false;
+        let lastBlobUrl = null;
+        let userInteracted = false;
+        let currentPlaybackPosition = 0;
+        let isPlaying = false;
+        
+        // Stats tracking
+        let streamStartTime = 0;
+        let lastChunkTime = 0;
+        let chunkCount = 0;
+        let totalBytes = 0;
+        let chunkSizes = [];
+        let blobCreateCount = 0;
+        let resumeCount = 0;
+
+        function log(message, highlight = false) {
+            const timestamp = new Date().toISOString();
+            const className = highlight ? 'highlight' : '';
+            debugDiv.innerHTML += `<div class="${className}">${timestamp}: ${message}</div>`;
+            console.log(`${timestamp}: ${message}`);
+            // Auto scroll to bottom
+            debugDiv.scrollTop = debugDiv.scrollHeight;
+        }
+
+        function updateStatus(message) {
+            statusText.textContent = message;
+            log(message);
+        }
+
+        function updatePlaybackInfo() {
+            playbackInfo.innerHTML = `
+                <div><b>Playback State:</b></div>
+                <div>Current Position: ${audio.currentTime.toFixed(2)}s</div>
+                <div>Paused: ${audio.paused}</div>
+                <div>Resume Count: ${resumeCount}</div>
+            `;
+        }
+
+        function updateStreamStats() {
+            const now = Date.now();
+            const elapsedTime = (now - streamStartTime) / 1000;
+            const avgChunkSize = totalBytes > 0 && chunkCount > 0 ? Math.round(totalBytes / chunkCount) : 0;
+            const bytesPerSecond = elapsedTime > 0 ? Math.round(totalBytes / elapsedTime) : 0;
+            const kbps = Math.round(bytesPerSecond * 8 / 1024);
+            
+            streamStats.innerHTML = `
+                <div>Chunks: <b>${chunkCount}</b></div>
+                <div>Elapsed: <b>${elapsedTime.toFixed(1)}s</b></div>
+                <div>Data: <b>${formatBytes(totalBytes)}</b></div>
+                <div>Speed: <b>${kbps} kbps</b></div>
+                <div>Avg Chunk: <b>${formatBytes(avgChunkSize)}</b></div>
+            `;
+        }
+
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        }
+
+        // 显示音频元数据
+        function displayAudioMetadata() {
+            const duration = isNaN(audio.duration) ? 'Loading...' : audio.duration.toFixed(2);
+            audioInfo.innerHTML = `
+                <div><b>Audio Element State:</b></div>
+                Duration: ${duration}s
+                Current Time: ${audio.currentTime.toFixed(2)}s
+                Sample Rate: ${audio.sampleRate || 'Unknown'}Hz
+                Channel Count: ${audio.mozChannels || audio.channelCount || 'Unknown'}
+                Ready State: ${audio.readyState} (${getReadyStateText(audio.readyState)})
+                Paused: ${audio.paused}
+                Network State: ${audio.networkState} (${getNetworkStateText(audio.networkState)})
+                Source: ${audio.src ? audio.src.substring(0, 30) + '...' : 'None'}
+            `;
+            
+            // 更新播放状态信息
+            updatePlaybackInfo();
+        }
+
+        function getReadyStateText(state) {
+            const states = ['HAVE_NOTHING', 'HAVE_METADATA', 'HAVE_CURRENT_DATA', 'HAVE_FUTURE_DATA', 'HAVE_ENOUGH_DATA'];
+            return states[state] || 'Unknown';
+        }
+
+        function getNetworkStateText(state) {
+            const states = ['NETWORK_EMPTY', 'NETWORK_IDLE', 'NETWORK_LOADING', 'NETWORK_NO_SOURCE'];
+            return states[state] || 'Unknown';
+        }
+
+        // 保存当前播放位置
+        function savePlaybackPosition() {
+            if (!isNaN(audio.currentTime)) {
+                currentPlaybackPosition = audio.currentTime;
+                isPlaying = !audio.paused;
+                log(`Saved playback position: ${currentPlaybackPosition.toFixed(2)}s (playing: ${isPlaying})`, true);
+            }
+        }
+
+        // 恢复播放位置
+        async function resumePlayback(forcePlay = false) {
+            if (!isNaN(currentPlaybackPosition) && currentPlaybackPosition > 0) {
+                log(`Resuming playback at position: ${currentPlaybackPosition.toFixed(2)}s`, true);
+                audio.currentTime = currentPlaybackPosition;
+                resumeCount++;
+                
+                if (isPlaying || forcePlay) {
+                    try {
+                        await audio.play();
+                        log(`Playback resumed at position ${currentPlaybackPosition.toFixed(2)}s`);
+                    } catch (err) {
+                        log(`Failed to resume playback: ${err.message}`);
+                    }
+                }
+            }
+        }
+
+        // Play current audio
+        async function playAudio() {
+            try {
+                log('Manual play attempt...');
+                await audio.play();
+                log('Manual play succeeded');
+                updateStatus('Audio playback started manually');
+                userInteracted = true;
+                isPlaying = true;
+            } catch (error) {
+                log(`Manual play failed: ${error.message}`);
+                updateStatus(`Couldn't play audio: ${error.message}`);
+            }
+        }
+
+        // Clear debug log
+        function clearLog() {
+            debugDiv.innerHTML = '';
+            log('Debug log cleared');
+        }
+
+        async function fetchAudioStream() {
+            if (isStreaming) return;
+            isStreaming = true;
+            startButton.disabled = true;
+            playButton.disabled = true;
+            updateStatus('Starting stream...');
+            
+            // 重置播放数据但保留播放位置
+            const wasPlaying = !audio.paused;
+            const shouldRestorePosition = audioChunks.length > 0 && !isNaN(audio.currentTime) && audio.currentTime > 0;
+            const positionToRestore = shouldRestorePosition ? audio.currentTime : 0;
+            
+            // Reset variables
+            audioChunks = [];
+            if (lastBlobUrl) {
+                URL.revokeObjectURL(lastBlobUrl);
+                lastBlobUrl = null;
+            }
+            audio.pause();
+            audio.src = '';
+            autoPlayStarted = userInteracted; // 保持用户交互状态
+            resumeCount = 0;
+            
+            if (shouldRestorePosition) {
+                currentPlaybackPosition = positionToRestore;
+                isPlaying = wasPlaying;
+                log(`Stored playback position for restore: ${currentPlaybackPosition.toFixed(2)}s (playing: ${isPlaying})`, true);
+            }
+            
+            // Reset stats
+            streamStartTime = Date.now();
+            lastChunkTime = 0;
+            chunkCount = 0;
+            totalBytes = 0;
+            chunkSizes = [];
+            blobCreateCount = 0;
+            updateStreamStats();
+            updatePlaybackInfo();
+            
+            try {
+                log('Fetching audio stream from server...');
+                const response = await fetch('http://localhost:3000/audio-stream');
+                log(`Response received with status: ${response.status}`);
+                
+                const contentType = response.headers.get('content-type');
+                log(`Server responded with Content-Type: ${contentType}`, true);
+                
+                const contentLength = response.headers.get('content-length');
+                if (contentLength) {
+                    log(`Content-Length header indicates ${formatBytes(parseInt(contentLength))} of data`);
+                } else {
+                    log('No Content-Length header, streaming size unknown', true);
+                }
+                
+                updateStatus('Receiving audio data...');
+
+                const reader = response.body.getReader();
+                let isFirstChunk = true;
+
+                while (true) {
+                    const startReadTime = Date.now();
+                    const { done, value } = await reader.read();
+                    const endReadTime = Date.now();
+                    const readTime = endReadTime - startReadTime;
+                    
+                    if (done) {
+                        log(`Stream complete after receiving ${chunkCount} chunks (${formatBytes(totalBytes)})`, true);
+                        
+                        // 在创建最终blob前保存播放位置
+                        savePlaybackPosition();
+                        
+                        // Create a final complete blob
+                        log('Creating final audio blob...');
+                        blobCreateCount++;
+                        const createStart = performance.now();
+                        const audioBlob = new Blob(audioChunks, { 
+                            type: contentType || 'audio/wav' 
+                        });
+                        const createEnd = performance.now();
+                        log(`Blob creation took ${(createEnd - createStart).toFixed(2)}ms`);
+                        
+                        // Clean up old URL
+                        if (lastBlobUrl) {
+                            URL.revokeObjectURL(lastBlobUrl);
+                        }
+                        
+                        lastBlobUrl = URL.createObjectURL(audioBlob);
+                        log(`Created final blob URL: ${lastBlobUrl} (Total size: ${formatBytes(totalBytes)})`, true);
+                        
+                        // Set the final audio source
+                        audio.src = lastBlobUrl;
+                        log('Final audio source set');
+                        
+                        // 等待音频元数据加载，然后恢复播放位置
+                        audio.addEventListener('loadedmetadata', async () => {
+                            // 尝试恢复位置并播放
+                            await resumePlayback(userInteracted || isPlaying);
+                            log('Position restored after final blob load');
+                        }, { once: true });
+                        
+                        startButton.disabled = false;
+                        startButton.textContent = 'Restart Stream';
+                        playButton.disabled = false; // 允许手动播放
+                        isStreaming = false;
+                        break;
+                    }
+
+                    // Process received chunk
+                    chunkCount++;
+                    const currentTime = Date.now();
+                    const timeSinceLastChunk = lastChunkTime ? currentTime - lastChunkTime : 0;
+                    lastChunkTime = currentTime;
+                    totalBytes += value.length;
+                    chunkSizes.push(value.length);
+                    
+                    if (isFirstChunk) {
+                        log(`Received first chunk (${formatBytes(value.length)}) after ${(currentTime - streamStartTime)}ms`, true);
+                        isFirstChunk = false;
+                    } else {
+                        log(`Chunk #${chunkCount}: ${formatBytes(value.length)} bytes (wait: ${timeSinceLastChunk}ms, read: ${readTime}ms)`);
+                    }
+                    
+                    updateStreamStats();
+                    audioChunks.push(value);
+                    
+                    // Update audio source every 5 chunks
+                    if (audioChunks.length % 5 === 0) {
+                        log(`Creating intermediate blob after ${audioChunks.length} chunks (${formatBytes(totalBytes)})`, true);
+                        
+                        // 在创建新blob前保存当前播放位置
+                        savePlaybackPosition();
+                        
+                        blobCreateCount++;
+                        const tempBlob = new Blob(audioChunks, { 
+                            type: contentType || 'audio/wav' 
+                        });
+                        
+                        // Clean up old URL
+                        if (lastBlobUrl) {
+                            URL.revokeObjectURL(lastBlobUrl);
+                        }
+                        
+                        lastBlobUrl = URL.createObjectURL(tempBlob);
+                        log(`Created intermediate blob URL #${blobCreateCount}: ${lastBlobUrl}`);
+                        log(`Setting audio source to blob #${blobCreateCount} (${formatBytes(totalBytes)})`);
+                        
+                        audio.src = lastBlobUrl;
+
+                        if (!autoPlayStarted && !userInteracted) {
+                            // 第一次尝试自动播放，如果用户尚未交互
+                            try {
+                                await audio.play();
+                                autoPlayStarted = true;
+                                userInteracted = true;
+                                isPlaying = true;
+                                log('First auto-play succeeded - STREAMING IS WORKING!', true);
+                                updateStatus('Playback started - Streaming continues...');
+                                audio.addEventListener('loadedmetadata', displayAudioMetadata);
+                                audio.addEventListener('timeupdate', displayAudioMetadata);
+                            } catch (playError) {
+                                log(`First auto-play failed: ${playError.message}`, true);
+                                updateStatus(`需要用户交互 - 请点击播放按钮一次`);
+                                playButton.disabled = false;
+                            }
+                        } else {
+                            // 等待音频元数据加载，然后恢复播放位置
+                            audio.addEventListener('loadedmetadata', async () => {
+                                // 尝试恢复之前的播放位置
+                                await resumePlayback(userInteracted || isPlaying);
+                                log(`Position restored to ${audio.currentTime.toFixed(2)}s`);
+                            }, { once: true });
+                        }
+                    }
+                }
+            } catch (error) {
+                log(`Stream error: ${error.message}`, true);
+                updateStatus(`Error: ${error.message}`);
+                startButton.disabled = false;
+                startButton.textContent = 'Retry Stream';
+                playButton.disabled = false;
+                isStreaming = false;
+            }
+        }
+
+        // Add event listeners
+        startButton.addEventListener('click', fetchAudioStream);
+        playButton.addEventListener('click', playAudio);
+        clearButton.addEventListener('click', clearLog);
+        
+        // Monitor audio element state changes
+        audio.addEventListener('loadedmetadata', () => {
+            log('Audio metadata loaded', true);
+            displayAudioMetadata();
+        });
+        
+        audio.addEventListener('canplay', () => {
+            log('Audio can play event fired');
+            playButton.disabled = false;
+        });
+        
+        audio.addEventListener('play', () => {
+            log('Audio play event fired');
+            isPlaying = true;
+            updatePlaybackInfo();
+        });
+        
+        audio.addEventListener('pause', () => {
+            log('Audio pause event fired');
+            isPlaying = false;
+            updatePlaybackInfo();
+        });
+        
+        audio.addEventListener('seeking', () => {
+            log(`Audio seeking to ${audio.currentTime.toFixed(2)}s`);
+        });
+        
+        audio.addEventListener('seeked', () => {
+            log(`Audio seeked to ${audio.currentTime.toFixed(2)}s`);
+            currentPlaybackPosition = audio.currentTime;
+            updatePlaybackInfo();
+        });
+        
+        audio.addEventListener('error', (e) => {
+            log(`Audio error: ${audio.error ? audio.error.message : 'unknown'}`, true);
+        });
+
+        // Update audio metadata regularly during playback
+        setInterval(displayAudioMetadata, 1000);
+
+        // Log supported audio types
+        log('Supported audio types:');
+        const audioTest = document.createElement('audio');
+        ['audio/wav', 'audio/webm', 'audio/ogg', 'audio/mpeg'].forEach(type => {
+            log(`${type}: ${audioTest.canPlayType(type)}`);
+        });
+    </script>
+</body>
+</html>

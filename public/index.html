@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>音频流播放器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .player-container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            background-color: #e9ecef;
+        }
+        .visualizer {
+            margin-top: 20px;
+            height: 100px;
+            background-color: #000;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="player-container">
+        <h1>音频流播放器</h1>
+        <div class="controls">
+            <button id="startStream">开始播放</button>
+            <button id="stopStream" disabled>停止播放</button>
+        </div>
+        <div id="status">准备就绪</div>
+        <canvas id="visualizer" class="visualizer"></canvas>
+    </div>
+
+    <script>
+        const startButton = document.getElementById('startStream');
+        const stopButton = document.getElementById('stopStream');
+        const statusElement = document.getElementById('status');
+        const visualizer = document.getElementById('visualizer');
+        const canvasCtx = visualizer.getContext('2d');
+
+        let audioContext = null;
+        let audioBuffer = null;
+        let source = null;
+        let analyser = null;
+        let isPlaying = false;
+
+        startButton.addEventListener('click', startStreaming);
+        stopButton.addEventListener('click', stopStreaming);
+
+        async function startStreaming() {
+            try {
+                statusElement.textContent = '正在连接音频流...';
+                startButton.disabled = true;
+                stopButton.disabled = false;
+
+                // 创建音频上下文
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // 创建分析器节点
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                
+                // 连接分析器到音频上下文
+                analyser.connect(audioContext.destination);
+
+                // 开始获取音频流
+                const response = await fetch('http://localhost:3000/audio-stream');
+                const reader = response.body.getReader();
+                
+                // 用于存储音频数据
+                const chunks = [];
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    console.log('reader', response);
+                    if (done) break;
+                    chunks.push(value);
+                }
+
+                // 合并所有数据块
+                const audioData = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 0));
+                let offset = 0;
+                for (const chunk of chunks) {
+                    audioData.set(chunk, offset);
+                    offset += chunk.length;
+                }
+
+                // 解码音频数据
+                audioBuffer = await audioContext.decodeAudioData(audioData.buffer);
+                
+                // 创建音频源
+                source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                
+                // 连接音频源到分析器
+                source.connect(analyser);
+                
+                // 开始播放
+                source.start(0);
+                isPlaying = true;
+                
+                // 开始可视化
+                visualize();
+                
+                statusElement.textContent = '正在播放...';
+            } catch (error) {
+                console.error('流式传输错误:', error);
+                statusElement.textContent = '播放出错: ' + error.message;
+                startButton.disabled = false;
+                stopButton.disabled = true;
+            }
+        }
+
+        function visualize() {
+            if (!isPlaying) return;
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+
+            canvasCtx.fillStyle = 'rgb(0, 0, 0)';
+            canvasCtx.fillRect(0, 0, visualizer.width, visualizer.height);
+
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeStyle = 'rgb(0, 255, 0)';
+            canvasCtx.beginPath();
+
+            const sliceWidth = visualizer.width / bufferLength;
+            let x = 0;
+
+            for (let i = 0; i < bufferLength; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = v * visualizer.height / 2;
+
+                if (i === 0) {
+                    canvasCtx.moveTo(x, y);
+                } else {
+                    canvasCtx.lineTo(x, y);
+                }
+
+                x += sliceWidth;
+            }
+
+            canvasCtx.lineTo(visualizer.width, visualizer.height / 2);
+            canvasCtx.stroke();
+
+            requestAnimationFrame(visualize);
+        }
+
+        function stopStreaming() {
+            if (source) {
+                source.stop();
+                source.disconnect();
+                source = null;
+            }
+            
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            isPlaying = false;
+            statusElement.textContent = '已停止';
+            startButton.disabled = false;
+            stopButton.disabled = true;
+        }
+    </script>
+</body>
+</html> 

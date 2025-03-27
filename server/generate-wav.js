@@ -44,10 +44,44 @@ const generateSineWave = (frequency, duration) => {
 
 // 生成WAV文件
 const frequency = 440; // 440Hz (A4音符)
-const duration = 3; // 3秒
+const duration = 30; // 3秒
 const dataBuffer = generateSineWave(frequency, duration);
 const headerBuffer = generateWavHeader(dataBuffer.length);
 
 // 将头部和数据写入文件
 fs.writeFileSync('sample.wav', Buffer.concat([headerBuffer, dataBuffer]));
-console.log('已生成示例WAV文件：sample.wav'); 
+console.log('已生成示例WAV文件：sample.wav');
+
+const CHUNK_SIZE = 4096; // 建议是2的整数倍
+const alignedChunkSize = Math.floor(CHUNK_SIZE / 2) * 2; // 确保是2字节的整数倍
+
+function sliceAudioData(audioBuffer) {
+    // 确保切片大小是采样点大小的整数倍
+    const chunks = [];
+    for (let i = 0; i < audioBuffer.length; i += alignedChunkSize) {
+        chunks.push(audioBuffer.slice(i, i + alignedChunkSize));
+    }
+    return chunks;
+}
+
+app.get('/audio-stream', async (req, res) => {
+    res.setHeader('Content-Type', 'audio/raw');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    
+    // 音频参数头信息
+    const audioFormat = {
+        sampleRate: 44100,
+        channels: 1,
+        bitDepth: 16
+    };
+    
+    // 发送音频数据
+    const audioChunks = sliceAudioData(rawAudioData);
+    for (const chunk of audioChunks) {
+        if (!res.write(chunk)) {
+            // 处理背压
+            await new Promise(resolve => res.once('drain', resolve));
+        }
+    }
+    res.end();
+}); 

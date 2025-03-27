@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时音频流播放器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            background-color: #f8f9fa;
+        }
+        .visualizer {
+            width: 100%;
+            height: 100px;
+            background-color: #000;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>实时音频流播放器</h1>
+        <div class="controls">
+            <button id="startBtn">开始播放</button>
+            <button id="stopBtn" disabled>停止播放</button>
+        </div>
+        <div class="status" id="status">就绪</div>
+        <canvas id="visualizer" class="visualizer"></canvas>
+    </div>
+
+    <script>
+        // 常量定义
+        const BUFFER_SIZE = 4096;
+        const SAMPLE_RATE = 44100;
+
+        // DOM 元素
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusEl = document.getElementById('status');
+        const visualizer = document.getElementById('visualizer');
+        const ctx = visualizer.getContext('2d');
+
+        // 音频播放器类
+        class AudioPlayer extends EventTarget {
+            constructor() {
+                super();
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                this.isPlaying = false;
+                this.scriptNode = null;
+                this.analyser = null;
+                this.audioQueue = [];
+                this.bufferThreshold = 2048; // 缓冲区阈值
+                this.processingInterval = 50; // 处理间隔（毫秒）
+                this.lastProcessTime = 0;
+                this.underrunCount = 0; // 缓冲区不足计数
+            }
+
+            async start() {
+                if (this.isPlaying) return;
+                this.isPlaying = true;
+                this.dispatchEvent(new Event('start'));
+
+                try {
+                    // 创建音频处理节点
+                    this.scriptNode = this.audioContext.createScriptProcessor(2048, 1, 1);
+                    this.analyser = this.audioContext.createAnalyser();
+                    this.analyser.fftSize = 2048;
+
+                    // 连接节点
+                    this.scriptNode.connect(this.analyser);
+                    this.analyser.connect(this.audioContext.destination);
+
+                    // 设置音频处理回调
+                    this.scriptNode.onaudioprocess = (e) => {
+                        const outputBuffer = e.outputBuffer.getChannelData(0);
+                        
+                        if (!this.isPlaying) {
+                            // 停止播放时，输出静音
+                            outputBuffer.fill(0);
+                            return;
+                        }
+
+                        if (this.audioQueue.length < this.bufferThreshold) {
+                            // 缓冲区不足，记录并输出静音
+                            this.underrunCount++;
+                            outputBuffer.fill(0);
+                            if (this.underrunCount > 5) {
+                                // 连续多次缓冲区不足，调整处理策略
+                                this.bufferThreshold = Math.min(this.bufferThreshold * 1.5, 8192);
+                                this.underrunCount = 0;
+                            }
+                            return;
+                        }
+
+                        // 重置缓冲区不足计数
+                        this.underrunCount = 0;
+
+                        // 处理音频数据
+                        const samplesToProcess = Math.min(outputBuffer.length, this.audioQueue.length);
+                        for (let i = 0; i < samplesToProcess; i++) {
+                            outputBuffer[i] = this.audioQueue[i];
+                        }
+
+                        // 移除已处理的数据
+                        this.audioQueue.splice(0, samplesToProcess);
+
+                        // 如果缓冲区过大，动态减小阈值
+                        if (this.audioQueue.length > this.bufferThreshold * 2) {
+                            this.bufferThreshold = Math.max(2048, this.bufferThreshold * 0.8);
+                        }
+                    };
+
+                    // 开始获取音频流
+                    await this.fetchAudioStream();
+                } catch (error) {
+                    console.error('播放错误:', error);
+                    this.dispatchEvent(new CustomEvent('error', { detail: error }));
+                }
+            }
+
+            stop() {
+                this.isPlaying = false;
+                if (this.scriptNode) {
+                    this.scriptNode.disconnect();
+                    this.scriptNode = null;
+                }
+                if (this.analyser) {
+                    this.analyser.disconnect();
+                    this.analyser = null;
+                }
+                this.audioQueue = [];
+                this.dispatchEvent(new Event('stop'));
+            }
+
+            async fetchAudioStream() {
+                try {
+                    const response = await fetch('http://localhost:3000/audio-stream');
+                    if (!response.ok) throw new Error('网络请求失败');
+                    if (!response.body) throw new Error('不支持流式响应');
+
+                    // 获取音频格式信息
+                    const sampleRate = parseInt(response.headers.get('X-Audio-Sample-Rate')) || 44100;
+                    const channels = parseInt(response.headers.get('X-Audio-Channels')) || 1;
+                    const bitsPerSample = parseInt(response.headers.get('X-Audio-Bits-Per-Sample')) || 16;
+
+                    // 更新音频上下文采样率
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: sampleRate
+                    });
+
+                    const reader = response.body.getReader();
+                    let receivedBuffer = new Uint8Array(0);
+                    
+                    while (this.isPlaying) {
+                        try {
+                            const { done, value } = await reader.read();
+                            if (done) {
+                                console.log('流式传输完成');
+                                break;
+                            }
+
+                            // 合并接收到的数据
+                            const newBuffer = new Uint8Array(receivedBuffer.length + value.length);
+                            newBuffer.set(receivedBuffer);
+                            newBuffer.set(value, receivedBuffer.length);
+                            receivedBuffer = newBuffer;
+
+                            // 确保数据长度是帧大小的整数倍
+                            const frameSize = (bitsPerSample / 8) * channels;
+                            const alignedLength = Math.floor(receivedBuffer.length / frameSize) * frameSize;
+
+                            if (alignedLength > 0) {
+                                // 处理对齐后的数据
+                                const audioData = receivedBuffer.slice(0, alignedLength);
+                                this.processAudioData(audioData);
+
+                                // 保存剩余数据
+                                receivedBuffer = receivedBuffer.slice(alignedLength);
+                            }
+                        } catch (readError) {
+                            console.error('读取数据错误:', readError);
+                            if (this.isPlaying) {
+                                this.dispatchEvent(new CustomEvent('error', { 
+                                    detail: new Error('读取音频数据失败') 
+                                }));
+                            }
+                            break;
+                        }
+                    }
+                } catch (error) {
+                    console.error('流式传输错误:', error);
+                    if (this.isPlaying) {
+                        this.dispatchEvent(new CustomEvent('error', { detail: error }));
+                    }
+                }
+            }
+
+            processAudioData(data) {
+                try {
+                    // 将Uint8Array转换为Float32Array
+                    const floatData = new Float32Array(data.length / 2);
+                    for (let i = 0; i < data.length; i += 2) {
+                        // 读取16位整数
+                        const int16 = (data[i + 1] << 8) | data[i];
+                        // 转换为浮点数 (-1.0 到 1.0)
+                        floatData[i / 2] = int16 / 32768.0;
+                    }
+
+                    // 添加到音频队列
+                    this.audioQueue.push(...floatData);
+
+                    // 更新可视化
+                    this.visualize(floatData);
+
+                    // 更新状态显示
+                    const bufferStatus = `缓冲区: ${this.audioQueue.length} 样本 (${Math.round(this.audioQueue.length / this.audioContext.sampleRate * 1000)}ms)`;
+                    statusEl.textContent = `正在播放... ${bufferStatus}`;
+
+                    // 更新最后处理时间
+                    this.lastProcessTime = performance.now();
+                } catch (error) {
+                    console.error('音频处理错误:', error);
+                }
+            }
+
+            visualize(audioData) {
+                const width = visualizer.width;
+                const height = visualizer.height;
+                ctx.fillStyle = 'rgb(0, 0, 0)';
+                ctx.fillRect(0, 0, width, height);
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = 'rgb(0, 255, 0)';
+                ctx.beginPath();
+                const sliceWidth = width / audioData.length;
+                let x = 0;
+                for (let i = 0; i < audioData.length; i++) {
+                    const v = audioData[i];
+                    const y = v * height / 2 + height / 2;
+                    if (i === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                    x += sliceWidth;
+                }
+                ctx.lineTo(width, height / 2);
+                ctx.stroke();
+            }
+        }
+
+        // 创建音频播放器实例
+        const player = new AudioPlayer();
+
+        // 事件处理
+        player.addEventListener('start', () => {
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            statusEl.textContent = '正在播放...';
+        });
+
+        player.addEventListener('stop', () => {
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusEl.textContent = '已停止';
+        });
+
+        player.addEventListener('error', (e) => {
+            console.error('播放错误:', e.detail);
+            statusEl.textContent = '错误: ' + e.detail.message;
+        });
+
+        // 按钮事件处理
+        startBtn.addEventListener('click', () => {
+            player.start();
+        });
+
+        stopBtn.addEventListener('click', () => {
+            player.stop();
+        });
+    </script>
+</body>
+</html> 
