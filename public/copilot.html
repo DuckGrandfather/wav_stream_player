@@ -111,6 +111,14 @@
         let blobCreateCount = 0;
         let resumeCount = 0;
 
+        // 添加新的状态变量
+        let lastPlaybackTime = 0;
+        let playbackMonitorInterval = null;
+        let consecutivePauseCount = 0;
+        const MAX_CONSECUTIVE_PAUSES = 3;
+        let nextBlobLoading = false;  // 跟踪下一个blob是否正在加载
+        let pendingBlobUrl = null;    // 存储待加载的blob URL
+
         function log(message, highlight = false) {
             const timestamp = new Date().toISOString();
             const className = highlight ? 'highlight' : '';
@@ -197,9 +205,32 @@
             }
         }
 
-        // 恢复播放位置
+        // 添加播放监控函数
+        function startPlaybackMonitor() {
+            if (playbackMonitorInterval) {
+                clearInterval(playbackMonitorInterval);
+            }
+            
+            playbackMonitorInterval = setInterval(() => {
+                if (audio.paused && isPlaying) {
+                    consecutivePauseCount++;
+                    log(`Playback paused unexpectedly (count: ${consecutivePauseCount})`);
+                    
+                    if (consecutivePauseCount >= MAX_CONSECUTIVE_PAUSES) {
+                        log('Too many consecutive pauses, attempting to resume playback', true);
+                        resumePlayback(true);
+                        consecutivePauseCount = 0;
+                    }
+                } else {
+                    consecutivePauseCount = 0;
+                    lastPlaybackTime = audio.currentTime;
+                }
+            }, 1000);
+        }
+
+        // 修改播放恢复函数
         async function resumePlayback(forcePlay = false) {
-            if (!isNaN(currentPlaybackPosition) && currentPlaybackPosition > 0) {
+            if (!isNaN(currentPlaybackPosition)) {
                 log(`Resuming playback at position: ${currentPlaybackPosition.toFixed(2)}s`, true);
                 audio.currentTime = currentPlaybackPosition;
                 resumeCount++;
@@ -211,12 +242,12 @@
                         const playPromise = audio.play();
                         if (playPromise !== undefined) {
                             await playPromise;
-                            isPlaying = true;  // 明确设置播放状态
+                            isPlaying = true;
+                            startPlaybackMonitor(); // 启动播放监控
                             log(`Playback resumed at position ${currentPlaybackPosition.toFixed(2)}s`);
                         }
                     } catch (err) {
                         log(`Failed to resume playback: ${err.message}`);
-                        // 如果是首次交互错误，提示用户
                         if (err.name === 'NotAllowedError' && !userInteracted) {
                             updateStatus('需要用户交互 - 请点击播放按钮');
                             playButton.disabled = false;
@@ -316,7 +347,8 @@
                         log(`Stream complete after receiving ${chunkCount} chunks (${formatBytes(totalBytes)})`, true);
                         
                         // 在创建最终blob前保存播放位置
-                        savePlaybackPosition();
+                        const wasPlaying = !audio.paused;
+                        const currentTime = audio.currentTime;
                         
                         // Create a final complete blob
                         log('Creating final audio blob...');
@@ -342,14 +374,32 @@
                         
                         // 等待音频元数据加载，然后恢复播放位置
                         audio.addEventListener('loadedmetadata', async () => {
-                            // 尝试恢复位置并播放
-                            await resumePlayback(userInteracted || isPlaying);
-                            log('Position restored after final blob load');
+                            try {
+                                // 恢复播放状态和时间位置
+                                if (!isNaN(currentTime) && currentTime > 0) {
+                                    audio.currentTime = currentTime;
+                                    log(`Restored final time position to ${currentTime.toFixed(2)}s`);
+                                }
+                                
+                                // 强制恢复播放状态
+                                if (wasPlaying || !autoPlayStarted) {
+                                    await audio.play();
+                                    isPlaying = true;
+                                    autoPlayStarted = true;
+                                    log(`Final playback ${!autoPlayStarted ? 'started' : 'continued'} at ${currentTime.toFixed(2)}s`, true);
+                                }
+                            } catch (err) {
+                                log(`Error during final playback: ${err.message}`);
+                                if (!userInteracted) {
+                                    updateStatus('需要用户交互 - 请点击播放按钮');
+                                    playButton.disabled = false;
+                                }
+                            }
                         }, { once: true });
                         
                         startButton.disabled = false;
                         startButton.textContent = 'Restart Stream';
-                        playButton.disabled = false; // 允许手动播放
+                        playButton.disabled = false;
                         isStreaming = false;
                         break;
                     }
@@ -371,79 +421,72 @@
                     
                     updateStreamStats();
                     audioChunks.push(value);
+
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                     
-                    // Update audio source every 5 chunks
-                    if (audioChunks.length % 5 === 0) {
+                    // 修改blob更新逻辑
+                    if (audioChunks.length % 10 === 0) {
                         log(`Creating intermediate blob after ${audioChunks.length} chunks (${formatBytes(totalBytes)})`, true);
                         
-                        // 在创建新blob前保存当前播放位置和状态
+                        // 在创建新blob前保存当前状态
                         const wasPlaying = !audio.paused;
-                        savePlaybackPosition();
+                        const currentTime = audio.currentTime;
                         
+                        // 创建新的blob和URL
                         blobCreateCount++;
                         const tempBlob = new Blob(audioChunks, { 
                             type: contentType || 'audio/wav' 
                         });
                         
-                        // Clean up old URL
+                        // 清理旧的URL
                         if (lastBlobUrl) {
                             URL.revokeObjectURL(lastBlobUrl);
                         }
                         
                         lastBlobUrl = URL.createObjectURL(tempBlob);
-                        log(`Created intermediate blob URL #${blobCreateCount}: ${lastBlobUrl}`);
-                        log(`Setting audio source to blob #${blobCreateCount} (${formatBytes(totalBytes)})`);
                         
-                        // 使用临时变量保存状态
-                        const currentPosition = currentPlaybackPosition;
-                        const shouldPlay = wasPlaying || isPlaying || userInteracted;
+                        // 创建临时音频元素预加载新blob
+                        const tempAudio = new Audio();
+                        tempAudio.src = lastBlobUrl;
                         
-                        // 设置新音频源
+                        // 等待临时音频加载完成
+                        await new Promise((resolve) => {
+                            tempAudio.addEventListener('loadedmetadata', () => {
+                                resolve();
+                            });
+                        });
+                        
+                        // 更新主音频元素
                         audio.src = lastBlobUrl;
-
-                        if (!autoPlayStarted && !userInteracted) {
-                            // 第一次尝试自动播放，如果用户尚未交互
-                            try {
-                                await audio.play();
-                                autoPlayStarted = true;
-                                userInteracted = true;
-                                isPlaying = true;
-                                log('First auto-play succeeded - STREAMING IS WORKING!', true);
-                                updateStatus('Playback started - Streaming continues...');
-                                audio.addEventListener('loadedmetadata', displayAudioMetadata);
-                                audio.addEventListener('timeupdate', displayAudioMetadata);
-                            } catch (playError) {
-                                log(`First auto-play failed: ${playError.message}`, true);
-                                updateStatus(`需要用户交互 - 请点击播放按钮一次`);
-                                playButton.disabled = false;
-                            }
-                        } else {
-                            // 等待音频元数据加载，然后强制恢复播放
+                        
+                        // 等待主音频加载完成
+                        await new Promise((resolve) => {
                             audio.addEventListener('loadedmetadata', async () => {
                                 try {
-                                    // 设置时间位置
-                                    audio.currentTime = currentPosition;
-                                    resumeCount++;
-                                    log(`Position restored to ${audio.currentTime.toFixed(2)}s`);
+                                    // 恢复播放状态和时间位置
+                                    if (!isNaN(currentTime) && currentTime > 0) {
+                                        audio.currentTime = currentTime;
+                                        log(`Restored time position to ${currentTime.toFixed(2)}s`);
+                                    }
                                     
                                     // 强制恢复播放状态
-                                    if (shouldPlay) {
-                                        const playPromise = audio.play();
-                                        if (playPromise !== undefined) {
-                                            await playPromise;
-                                            isPlaying = true;
-                                            log(`Playback continued with chunk #${blobCreateCount}`, true);
-                                        }
+                                    if (wasPlaying || !autoPlayStarted) {
+                                        await audio.play();
+                                        isPlaying = true;
+                                        autoPlayStarted = true;
+                                        log(`Playback ${!autoPlayStarted ? 'started' : 'continued'} at ${currentTime.toFixed(2)}s`, true);
                                     }
+                                    resolve();
                                 } catch (err) {
-                                    log(`Failed to continue playback: ${err.message}`);
+                                    log(`Error during playback: ${err.message}`);
                                     if (!userInteracted) {
                                         updateStatus('需要用户交互 - 请点击播放按钮');
                                         playButton.disabled = false;
                                     }
+                                    resolve();
                                 }
                             }, { once: true });
-                        }
+                        });
                     }
                 }
             } catch (error) {
@@ -475,11 +518,33 @@
         audio.addEventListener('play', () => {
             log('Audio play event fired');
             isPlaying = true;
+            startPlaybackMonitor(); // 启动播放监控
             updatePlaybackInfo();
         });
         
         audio.addEventListener('pause', () => {
             log('Audio pause event fired');
+            if (isPlaying && isStreaming) { // 只有在流式传输过程中且非预期暂停时才记录
+                log('Unexpected pause detected during streaming', true);
+                // 保存当前播放位置
+                const lastPosition = audio.currentTime;
+                log(`Saving last playback position: ${lastPosition.toFixed(2)}s`);
+                
+                // 尝试恢复播放
+                setTimeout(async () => {
+                    try {
+                        // 设置到上一个位置
+                        audio.currentTime = lastPosition;
+                        log(`Restored playback position to ${lastPosition.toFixed(2)}s`);
+                        
+                        await audio.play();
+                        isPlaying = true;
+                        log(`Recovered from unexpected pause at position ${lastPosition.toFixed(2)}s`);
+                    } catch (err) {
+                        log(`Failed to recover from pause: ${err.message}`);
+                    }
+                }, 100);
+            }
             isPlaying = false;
             updatePlaybackInfo();
         });
@@ -506,6 +571,34 @@
         const audioTest = document.createElement('audio');
         ['audio/wav', 'audio/webm', 'audio/ogg', 'audio/mpeg'].forEach(type => {
             log(`${type}: ${audioTest.canPlayType(type)}`);
+        });
+
+        // 修改ended事件监听器
+        audio.addEventListener('ended', async () => {
+            log('Current blob playback ended');
+            // 检查是否有更多数据
+            if (isStreaming) {
+                log('Stream is still active, waiting for next blob...');
+                // 保存当前播放位置
+                const lastPosition = audio.currentTime;
+                log(`Saving last playback position: ${lastPosition.toFixed(2)}s`);
+                
+                // 等待一小段时间，让新的blob有机会加载
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // 尝试继续播放
+                try {
+                    // 设置到上一个blob的结束位置
+                    audio.currentTime = lastPosition;
+                    log(`Restored playback position to ${lastPosition.toFixed(2)}s`);
+                    
+                    await audio.play();
+                    isPlaying = true;
+                    log(`Continued playback from position ${lastPosition.toFixed(2)}s`);
+                } catch (err) {
+                    log(`Error continuing playback: ${err.message}`);
+                }
+            }
         });
     </script>
 </body>

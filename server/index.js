@@ -11,8 +11,8 @@ const port = 3000;
 app.use(cors());
 
 // 延迟设置（毫秒）
-const CHUNK_DELAY = 3; // 每个分片之间的延迟
-const RANDOM_DELAY = 2; // 额外的随机延迟范围 (0-200ms)
+const CHUNK_DELAY = 200; // 每个分片之间的延迟
+const RANDOM_DELAY = 30; // 额外的随机延迟范围 (0-200ms)
 
 // 创建一个延迟函数
 function delay(ms) {
@@ -20,7 +20,7 @@ function delay(ms) {
 }
 
 // 模拟的WAV文件路径
-const sampleWavPath = path.join(__dirname, 'sample.wav');
+const sampleWavPath = path.join(__dirname, 'sample-2.wav');
 
 app.get('/audio-stream', async (req, res) => {
     if (!fs.existsSync(sampleWavPath)) {
